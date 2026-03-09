@@ -22,4 +22,5 @@ Thumbs.db
 db.sqlite3
 
 spec/
+archives/
 

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from . import parse_tasks
@@ -75,6 +76,244 @@ def do_reset(base_dir: Path, task_source: Path = None):
 
     print()
     print("  [OK] Reset complete. Project is ready for a fresh run.")
+    print("=" * 60)
+
+
+def do_archive(base_dir: Path, task_source: Path = None):
+    """
+    Archive all runtime-generated files into a timestamped directory.
+
+    The archive includes:
+      - state.json
+      - results.json
+      - runs/  (all round-*.json files)
+      - .tasks_cache.json
+      - .results_context.json
+      - The task source file (if provided)
+
+    Archive naming: <task_filename>_<yyyy-mm-dd_HH-MM-SS>/
+    Archives are stored in an 'archives/' directory under base_dir.
+    """
+    print("=" * 60)
+    print("  [ARCHIVE] Creating archive...")
+    print("=" * 60)
+
+    archives_dir = base_dir / 'archives'
+    archives_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build archive name
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if task_source and task_source.exists():
+        task_name = task_source.stem  # filename without extension
+    else:
+        task_name = "scheduler"
+    archive_name = f"{task_name}_{timestamp}"
+    archive_path = archives_dir / archive_name
+    archive_path.mkdir(parents=True, exist_ok=True)
+
+    # Collect files to archive
+    files_to_archive = [
+        base_dir / 'state.json',
+        base_dir / 'results.json',
+        base_dir / '.tasks_cache.json',
+        base_dir / '.results_context.json',
+    ]
+
+    archived_items = []
+    skipped_items = []
+
+    # Copy individual files
+    for f in files_to_archive:
+        if f.exists():
+            dest = archive_path / f.name
+            shutil.copy2(f, dest)
+            archived_items.append(f.name)
+        else:
+            skipped_items.append(f.name)
+
+    # Copy runs/ directory
+    runs_dir = base_dir / 'runs'
+    if runs_dir.exists():
+        run_files = [rf for rf in runs_dir.iterdir() if rf.is_file()]
+        if run_files:
+            dest_runs = archive_path / 'runs'
+            dest_runs.mkdir(exist_ok=True)
+            for rf in run_files:
+                shutil.copy2(rf, dest_runs / rf.name)
+                archived_items.append(f"runs/{rf.name}")
+        else:
+            skipped_items.append("runs/ (empty)")
+    else:
+        skipped_items.append("runs/")
+
+    # Copy task source file
+    if task_source and task_source.exists():
+        shutil.copy2(task_source, archive_path / task_source.name)
+        archived_items.append(task_source.name)
+
+    # Save metadata
+    meta = {
+        'task_source_original_path': str(task_source) if task_source else None,
+        'task_source_name': task_source.name if task_source else None,
+        'archived_at': timestamp,
+        'base_dir': str(base_dir),
+    }
+    meta_file = archive_path / '_archive_meta.json'
+    meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    # Calculate total size
+    total_size = sum(f.stat().st_size for f in archive_path.rglob('*') if f.is_file())
+
+    print()
+    if archived_items:
+        print("  [v] Archived files:")
+        for item in archived_items:
+            print(f"    - {item}")
+    if skipped_items:
+        print("  [>] Not found (skipped):")
+        for item in skipped_items:
+            print(f"    - {item}")
+
+    print()
+    print(f"  [OK] Archive created: {archive_path}")
+    print(f"       Total size: {total_size / 1024:.1f} KB")
+    print("=" * 60)
+    return archive_path
+
+
+def do_restore(base_dir: Path, archive_path: Path):
+    """
+    Restore runtime files from a previously created archive directory.
+
+    This will:
+      - Copy state.json, results.json, runs/, etc. back to base_dir
+      - Restore the task source file to its original location
+      - Overwrite any existing files
+    """
+    if not archive_path.exists():
+        # Try looking in archives/ directory
+        candidate = base_dir / 'archives' / archive_path.name
+        if candidate.exists():
+            archive_path = candidate
+        else:
+            print(f"Error: Archive not found: {archive_path}")
+            sys.exit(1)
+
+    if not archive_path.is_dir():
+        print(f"Error: Archive is not a directory: {archive_path}")
+        sys.exit(1)
+
+    print("=" * 60)
+    print(f"  [RESTORE] Restoring from archive...")
+    print(f"  Archive: {archive_path.name}")
+    print("=" * 60)
+
+    # Read metadata
+    meta = {}
+    meta_file = archive_path / '_archive_meta.json'
+    if meta_file.exists():
+        meta = json.loads(meta_file.read_text(encoding='utf-8'))
+
+    restored_items = []
+    task_source_name = meta.get('task_source_name')
+
+    # Files that go directly to base_dir
+    runtime_files = ['state.json', 'results.json', '.tasks_cache.json', '.results_context.json']
+
+    for fname in runtime_files:
+        src = archive_path / fname
+        if src.exists():
+            shutil.copy2(src, base_dir / fname)
+            restored_items.append(fname)
+
+    # Restore runs/ directory
+    src_runs = archive_path / 'runs'
+    if src_runs.exists() and src_runs.is_dir():
+        dest_runs = base_dir / 'runs'
+        dest_runs.mkdir(exist_ok=True)
+        for rf in src_runs.iterdir():
+            if rf.is_file():
+                shutil.copy2(rf, dest_runs / rf.name)
+                restored_items.append(f"runs/{rf.name}")
+
+    # Restore task source file
+    if task_source_name:
+        src_task = archive_path / task_source_name
+        if src_task.exists():
+            original_path = meta.get('task_source_original_path')
+            if original_path:
+                target = Path(original_path)
+            else:
+                target = base_dir / task_source_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_task, target)
+            restored_items.append(f"{task_source_name} → {target}")
+
+    print()
+    if restored_items:
+        print("  [v] Restored files:")
+        for item in restored_items:
+            print(f"    - {item}")
+
+    print()
+    print(f"  [OK] Restore complete. State recovered from: {archive_path.name}")
+    if meta.get('archived_at'):
+        print(f"       Archive timestamp: {meta['archived_at']}")
+    print("=" * 60)
+
+
+def do_list_archives(base_dir: Path):
+    """
+    List all available archive directories in the archives/ directory.
+    """
+    archives_dir = base_dir / 'archives'
+
+    print("=" * 60)
+    print("  [ARCHIVES] Available archives")
+    print("=" * 60)
+
+    if not archives_dir.exists():
+        print("\n  No archives found.")
+        print(f"  (Archives directory: {archives_dir})")
+        print("\n  Create one with: scheduler-harness --archive --task-source tasks.md")
+        print("=" * 60)
+        return
+
+    # Find archive directories (those containing _archive_meta.json)
+    archives = []
+    for d in sorted(archives_dir.iterdir(), reverse=True):
+        if d.is_dir() and (d / '_archive_meta.json').exists():
+            archives.append(d)
+
+    if not archives:
+        print("\n  No archives found.")
+        print(f"  (Archives directory: {archives_dir})")
+        print("\n  Create one with: scheduler-harness --archive --task-source tasks.md")
+        print("=" * 60)
+        return
+
+    print()
+    for i, arc in enumerate(archives, 1):
+        # Read metadata
+        try:
+            meta = json.loads((arc / '_archive_meta.json').read_text(encoding='utf-8'))
+            task_name = meta.get('task_source_name', '?')
+            archived_at = meta.get('archived_at', '?')
+        except Exception:
+            task_name = '?'
+            archived_at = '?'
+
+        # Count files (exclude metadata)
+        file_count = sum(1 for f in arc.rglob('*') if f.is_file() and f.name != '_archive_meta.json')
+        total_size = sum(f.stat().st_size for f in arc.rglob('*') if f.is_file())
+
+        print(f"  {i}. {arc.name}")
+        print(f"     Task source: {task_name}  |  Files: {file_count}  |  Size: {total_size / 1024:.1f} KB")
+        print(f"     Created: {archived_at.replace('_', ' ').replace('-', '-', 2).replace('-', ':', 2)}")
+        print()
+
+    print(f"  Total: {len(archives)} archive(s)")
+    print(f"  Restore with: scheduler-harness --restore <archive_folder_name>")
     print("=" * 60)
 
 
@@ -339,6 +578,13 @@ def main():
                              'Implies --mode task.')
     parser.add_argument('--reset', action='store_true',
                         help='Clean up all generated files (state.json, results.json, runs/, etc.) and exit')
+    parser.add_argument('--archive', action='store_true',
+                        help='Archive current runtime files (state, results, runs, task source) into a timestamped zip and exit')
+    parser.add_argument('--restore', type=str, default=None, metavar='ARCHIVE',
+                        help='Restore runtime state from a previously created archive and exit. '
+                             'Accepts a filename (looked up in archives/) or a full path.')
+    parser.add_argument('--list-archives', action='store_true',
+                        help='List all available archives and exit')
     parser.add_argument('--template', type=str, default=None,
                         help='Path to a custom prompt template file (see build-prompt --init-template)')
     parser.add_argument('--init-template', nargs='?', const='.prompt-template.md', metavar='PATH',
@@ -358,9 +604,25 @@ def main():
         print(f"  scheduler-harness --task-source tasks.md --template {output_path}")
         sys.exit(0)
 
+    if args.list_archives:
+        do_list_archives(work_dir)
+        sys.exit(0)
+
+    if args.restore:
+        archive_path = Path(args.restore)
+        if not archive_path.is_absolute():
+            archive_path = work_dir / 'archives' / archive_path
+        do_restore(work_dir, archive_path)
+        sys.exit(0)
+
     if args.reset:
         task_source = Path(args.task_source).absolute() if args.task_source else None
         do_reset(work_dir, task_source)
+        sys.exit(0)
+
+    if args.archive:
+        task_source = Path(args.task_source).absolute() if args.task_source else None
+        do_archive(work_dir, task_source)
         sys.exit(0)
 
     if not args.task_source:

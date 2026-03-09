@@ -2,7 +2,7 @@
 
 ## Phase 1: File Operations
 
-- [x] T001 Create a file named hello.txt with content "Hello World"
+- [ ] T001 Create a file named hello.txt with content "Hello World"
 - [ ] T002 Create a folder named output
 - [ ] T003 Copy hello.txt to output/hello_copy.txt
 - [ ] T004 Create a file output/info.txt with current date

@@ -49,6 +49,9 @@ scheduler-harness --task-source <path_to_tasks.md> [options]
 - `--max-rounds`: Maximum number of round requests to execute in one run. (Default: 20)
 - `--max-retries`: Maximum consecutive retries allowed for a failing or stalled batch before aborting. (Default: 3)
 - `--reset`: Clean up all runtime-generated files (`state.json`, `results.json`, `runs/`, temp files) and exit. If `--task-source` is also provided, resets all completed checkboxes (`- [x]` → `- [ ]`) in the task file.
+- `--archive`: Archive all current runtime-generated files (`state.json`, `results.json`, `runs/`, task source) into a timestamped directory under `archives/` and exit. Archive naming format: `<task_filename>_<yyyy-mm-dd_HH-MM-SS>/`.
+- `--restore <ARCHIVE>`: Restore runtime state from a previously created archive directory. Accepts a folder name (looked up in `archives/`) or a full path. Overwrites current files.
+- `--list-archives`: List all available archives with metadata (task source, file count, size, timestamp) and exit.
 - `--work-dir`: Working directory for output files (state, results, runs). Defaults to the current directory.
 - `--template <PATH>`: Path to a custom prompt template file. See [Prompt Template Customization](#prompt-template-customization) below.
 - `--init-template [PATH]`: Generate a default prompt template file for customization and exit. Defaults to `.prompt-template.md`.
@@ -152,4 +155,13 @@ scheduler-harness --reset
 
 # Clear generated files, and also reset the checkboxes in the task file
 scheduler-harness --reset --task-source demo_tasks.md
+
+# Archive current state (creates archives/demo_tasks_2026-03-09_14-30-00/)
+scheduler-harness --archive --task-source demo_tasks.md
+
+# List all available archives
+scheduler-harness --list-archives
+
+# Restore from a specific archive
+scheduler-harness --restore demo_tasks_2026-03-09_14-30-00
 ```
