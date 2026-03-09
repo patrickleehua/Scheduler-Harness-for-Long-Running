@@ -177,6 +177,23 @@ def do_archive(base_dir: Path, task_source: Path = None):
     print()
     print(f"  [OK] Archive created: {archive_path}")
     print(f"       Total size: {total_size / 1024:.1f} KB")
+
+    # Clean up original runtime files after successful archive
+    cleaned = []
+    for f in files_to_archive:
+        if f.exists():
+            f.unlink()
+            cleaned.append(f.name)
+    runs_dir = base_dir / 'runs'
+    if runs_dir.exists():
+        shutil.rmtree(runs_dir)
+        cleaned.append("runs/")
+    if cleaned:
+        print()
+        print("  [v] Cleaned up original files:")
+        for item in cleaned:
+            print(f"    - {item}")
+
     print("=" * 60)
     return archive_path
 
