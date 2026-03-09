@@ -41,10 +41,17 @@ scheduler-harness --task-source <path_to_tasks.md> [options]
 - `--mode {phase,task}`: Execution mode. `phase` runs all remaining tasks in a phase together. `task` runs them sequentially, subdivided by batches. (Default: `phase`)
 - `--batch-size`: How many tasks to pass to Claude per round in `task` mode. (Default: 1)
 - `--phase <PHASE_NAME>`: Run only a specific phase by exactly matching its title. Example: `--phase "Phase 1: File Operations"`
+- `--tasks <SELECTION>`: Select specific tasks to execute. Supported formats:
+  - **Range**: `--tasks "T001:T005"` — execute from T001 to T005 (inclusive, in file order)
+  - **Cherry-pick**: `--tasks "T001,T003,T007"` — execute only the listed tasks
+  - **Single**: `--tasks T003` — execute just one task
+  - Automatically implies `--mode task`. Already-completed tasks are skipped.
 - `--max-rounds`: Maximum number of round requests to execute in one run. (Default: 20)
 - `--max-retries`: Maximum consecutive retries allowed for a failing or stalled batch before aborting. (Default: 3)
 - `--reset`: Clean up all runtime-generated files (`state.json`, `results.json`, `runs/`, temp files) and exit. If `--task-source` is also provided, resets all completed checkboxes (`- [x]` → `- [ ]`) in the task file.
 - `--work-dir`: Working directory for output files (state, results, runs). Defaults to the current directory.
+- `--template <PATH>`: Path to a custom prompt template file. See [Prompt Template Customization](#prompt-template-customization) below.
+- `--init-template [PATH]`: Generate a default prompt template file for customization and exit. Defaults to `.prompt-template.md`.
 
 ### Examples
 
@@ -73,6 +80,26 @@ scheduler-harness --reset
 scheduler-harness --reset --task-source demo_tasks.md
 ```
 
+**Execute a range of tasks (T002 through T005):**
+```bash
+scheduler-harness --task-source demo_tasks.md --tasks "T002:T005"
+```
+
+**Execute specific cherry-picked tasks:**
+```bash
+scheduler-harness --task-source demo_tasks.md --tasks "T001,T003,T008"
+```
+
+**Execute a single task:**
+```bash
+scheduler-harness --task-source demo_tasks.md --tasks T006
+```
+
+**Execute selected tasks with batch size 2:**
+```bash
+scheduler-harness --task-source demo_tasks.md --tasks "T003:T007" --batch-size 2
+```
+
 ## Task File Format (`tasks.md`)
 
 Tasks are defined in standard Markdown checklists under Phase headers (`##`). The header format and checkbox formats are evaluated strictly:
@@ -89,30 +116,40 @@ Tasks are defined in standard Markdown checklists under Phase headers (`##`). Th
 ```
 *Note: Phase headers must be exactly `## Phase Title`. Task lines must be `- [ ] ID Description` where ID starts with alphabetical letters followed by numbers (e.g., T001, B23).*
 
+## Prompt Template Customization
+
+The prompt sent to the LLM is fully customizable. The template is plain text — just edit it directly. Only 3 runtime placeholders (`{{PREVIOUS_RESULTS}}`, `{{TASK_ID_LIST}}`, `{{TASK_DETAILS}}`) are auto-filled from task data; everything else is your own text.
+
+```bash
+# Generate a default template, edit it, then use it
+scheduler-harness --init-template                                        # → .prompt-template.md
+scheduler-harness --task-source tasks.md --template .prompt-template.md  # use custom template
+```
+
 ## How it Works
 
 1. **`parse-tasks`** scans the Markdown text to find the first Phase with uncompleted tasks.
 2. **`scheduler-harness`** fetches the tasks according to the selected `--mode` (`phase` or `task`).
 3. **`scheduler-harness`** loads the accumulated historical results from `results.json` and injects them as active context.
-4. **`build-prompt`** constructs a rigid instruction prompt for Claude.
+4. **`build-prompt`** constructs the instruction prompt for Claude using the template (custom or built-in default).
 5. Claude executes the requested commands/bash shell prompts.
 6. **`apply-results`** parses Claude's JSON output, marks the tasks as `[x]` in the original `tasks.md`, and pushes the execution traces backward into `results.json`.
 7. Increments the state tracking in `state.json` and loops back to step 1 automatically.
 
 
 ```bash
-# 按 Phase 顺序执行所有任务
+# Execute all tasks in order of Phase
 scheduler-harness --task-source demo_tasks.md --batch-size 2 --max-rounds 20
 
-# 只执行指定 Phase
+# Execute only the specified Phase
 scheduler-harness --task-source demo_tasks.md --phase "Phase 2: Data Processing"
 
-# 查看 Phase 状态
+# Check the status of Phases
 parse-tasks --task-source demo_tasks.md --list-phases
 
-# 清除所有生成文件，恢复到初始状态
+# Clear all generated files and restore to the initial state
 scheduler-harness --reset
 
-# 清除生成文件，同时重置任务文件中的复选框
+# Clear generated files, and also reset the checkboxes in the task file
 scheduler-harness --reset --task-source demo_tasks.md
 ```

@@ -92,6 +92,65 @@ def get_phase_summary(tasks: list[dict]) -> list[dict]:
     return summary
 
 
+def get_all_task_ids(tasks: list[dict]) -> list[str]:
+    """Return all task IDs in order of appearance."""
+    return [t['id'] for t in tasks]
+
+
+def filter_tasks_by_selection(tasks: list[dict], selection: str) -> list[dict]:
+    """
+    Filter tasks by a selection string.
+
+    Supported formats:
+      - Range:       "T001:T005"  → tasks from T001 to T005 (inclusive)
+      - Cherry-pick: "T001,T003,T007" → only the listed tasks
+      - Single:      "T003" → just that one task
+
+    Tasks are returned in their original order from the task file.
+    Already-completed tasks ARE included (so we can show them as skipped).
+    """
+    selection = selection.strip()
+    all_ids = get_all_task_ids(tasks)
+
+    if ':' in selection:
+        # Range mode: "T001:T005"
+        parts = selection.split(':', 1)
+        start_id = parts[0].strip()
+        end_id = parts[1].strip()
+
+        if start_id not in all_ids:
+            print(f"⚠ Warning: Start task '{start_id}' not found in task file.")
+            print(f"  Available IDs: {all_ids}")
+            return []
+        if end_id not in all_ids:
+            print(f"⚠ Warning: End task '{end_id}' not found in task file.")
+            print(f"  Available IDs: {all_ids}")
+            return []
+
+        start_idx = all_ids.index(start_id)
+        end_idx = all_ids.index(end_id)
+
+        if start_idx > end_idx:
+            print(f"⚠ Warning: Start task '{start_id}' appears after end task '{end_id}'. Swapping.")
+            start_idx, end_idx = end_idx, start_idx
+
+        selected_ids = set(all_ids[start_idx:end_idx + 1])
+    else:
+        # Cherry-pick mode: "T001,T003,T007" or single "T003"
+        picked = [s.strip() for s in selection.split(',') if s.strip()]
+        missing = [tid for tid in picked if tid not in all_ids]
+        if missing:
+            print(f"⚠ Warning: Task(s) not found: {missing}")
+            print(f"  Available IDs: {all_ids}")
+        selected_ids = set(picked) & set(all_ids)
+
+    if not selected_ids:
+        return []
+
+    # Return tasks in original order
+    return [t for t in tasks if t['id'] in selected_ids]
+
+
 def main():
     parser = argparse.ArgumentParser(description='Parse tasks.md and return uncompleted tasks')
     parser.add_argument('--task-source', required=True, help='Path to the tasks markdown file')

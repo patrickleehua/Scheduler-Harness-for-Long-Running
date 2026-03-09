@@ -124,6 +124,81 @@ def get_uncompleted_tasks_for_phase(task_source: Path, phase: str, limit: int = 
     return [{'id': t['id'], 'description': t['description'], 'phase': t.get('phase')} for t in uncompleted]
 
 
+def get_selected_tasks(task_source: Path, selection: str) -> list[dict]:
+    """Get tasks filtered by selection string (range or cherry-pick)."""
+    content = task_source.read_text(encoding='utf-8')
+    all_tasks = parse_tasks.parse_tasks(content)
+    selected = parse_tasks.filter_tasks_by_selection(all_tasks, selection)
+    return [{'id': t['id'], 'description': t['description'], 'phase': t.get('phase'), 'completed': t['completed']} for t in selected]
+
+
+def _execute_round(tasks: list[dict], args, base_dir: Path, runs_dir: Path, state: dict, results_file: Path, label: str = "") -> bool:
+    """
+    Execute a single round of tasks: build prompt, call Claude, apply results.
+    Returns True on success, False on failure.
+    """
+    task_source = args.task_source
+
+    accumulated_results = load_accumulated_results(results_file)
+
+    # Build prompt (use template if specified)
+    template_path = getattr(args, 'template', None)
+    prompt = build_prompt.build_prompt(tasks, accumulated_results, template_path=template_path)
+    if accumulated_results:
+        print(f"    Passing {len(accumulated_results)} previous result(s) as context")
+
+    output_file = runs_dir / f"round-{state['round']}.json"
+
+    # Run Claude
+    print("    Running Claude...")
+    try:
+        claude_result = subprocess.run(
+            'claude --print --dangerously-skip-permissions',
+            input=prompt,
+            capture_output=True,
+            text=True,
+            shell=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        cleaned_output = strip_code_fences(claude_result.stdout)
+        output_file.write_text(cleaned_output, encoding='utf-8')
+        print(f"    Output saved to: {output_file}")
+    except FileNotFoundError:
+        print("    ⚠ Claude CLI not found, creating mock output...")
+        task_ids = [t['id'] for t in tasks]
+        mock_output = {
+            "completed": task_ids,
+            "failed": [],
+            "blocked": []
+        }
+        output_file.write_text(json.dumps(mock_output, indent=2), encoding='utf-8')
+        print(f"    Mock output saved to: {output_file}")
+
+    # Apply results
+    print("    Applying results...")
+    try:
+        results = apply_results.parse_output_file(output_file)
+        completed = results.get('completed', [])
+        if completed:
+            apply_results.update_tasks_file(task_source, completed)
+        apply_results.save_task_results(results_file, results)
+    except Exception as e:
+        print(f"    Apply failed: {e}")
+
+    # Update state
+    state_file = base_dir / 'state.json'
+    state['task_source'] = str(task_source)
+    state['last_run_file'] = output_file.name
+    if label:
+        state['current_phase'] = label
+    state_file.write_text(json.dumps(state, indent=2))
+
+    print(f"    ✓ Round {state['round']} done.")
+    time.sleep(1)
+    return True
+
+
 def run_phase(phase_name: str, args, base_dir: Path, runs_dir: Path, state: dict, results_file: Path) -> bool:
     """
     Run all tasks in a single phase until complete.
@@ -165,61 +240,83 @@ def run_phase(phase_name: str, args, base_dir: Path, runs_dir: Path, state: dict
             for t in tasks:
                 print(f"    - {t['id']}: {t['description'][:60]}")
 
-        accumulated_results = load_accumulated_results(results_file)
+        _execute_round(tasks, args, base_dir, runs_dir, state, results_file, label=phase_name)
 
-        # Build prompt
-        prompt = build_prompt.build_prompt(tasks, accumulated_results)
-        if accumulated_results:
-            print(f"    Passing {len(accumulated_results)} previous result(s) as context")
+    return True
 
-        output_file = runs_dir / f"round-{state['round']}.json"
 
-        # Run Claude
-        print("    Running Claude...")
-        try:
-            claude_result = subprocess.run(
-                'claude --print --dangerously-skip-permissions',
-                input=prompt,
-                capture_output=True,
-                text=True,
-                shell=True,
-                encoding='utf-8',
-                errors='replace'
-            )
-            cleaned_output = strip_code_fences(claude_result.stdout)
-            output_file.write_text(cleaned_output, encoding='utf-8')
-            print(f"    Output saved to: {output_file}")
-        except FileNotFoundError:
-            print("    ⚠ Claude CLI not found, creating mock output...")
-            task_ids = [t['id'] for t in tasks]
-            mock_output = {
-                "completed": task_ids,
-                "failed": [],
-                "blocked": []
-            }
-            output_file.write_text(json.dumps(mock_output, indent=2), encoding='utf-8')
-            print(f"    Mock output saved to: {output_file}")
+def run_selected_tasks(args, base_dir: Path, runs_dir: Path, state: dict, results_file: Path) -> bool:
+    """
+    Run only the selected tasks (from --tasks argument).
+    Supports range (T001:T005) and cherry-pick (T001,T003,T007) syntax.
+    Returns True if all selected tasks completed, False otherwise.
+    """
+    task_source = args.task_source
+    selection = args.tasks
 
-        # Apply results
-        print("    Applying results...")
-        try:
-            results = apply_results.parse_output_file(output_file)
-            completed = results.get('completed', [])
-            if completed:
-                apply_results.update_tasks_file(task_source, completed)
-            apply_results.save_task_results(results_file, results)
-        except Exception as e:
-            print(f"    Apply failed: {e}")
+    all_selected = get_selected_tasks(task_source, selection)
 
-        # Update state
-        state_file = base_dir / 'state.json'
-        state['task_source'] = str(task_source)
-        state['last_run_file'] = output_file.name
-        state['current_phase'] = phase_name
-        state_file.write_text(json.dumps(state, indent=2))
+    if not all_selected:
+        print(f"\n⚠ No tasks matched the selection: '{selection}'")
+        return False
 
-        print(f"    ✓ Round {state['round']} done.")
-        time.sleep(1)
+    # Separate completed vs uncompleted
+    already_done = [t for t in all_selected if t.get('completed')]
+    pending = [t for t in all_selected if not t.get('completed')]
+
+    # Display selection summary
+    print(f"\n{'━' * 60}")
+    print(f"  ▶ Task Selection: {selection}")
+    print(f"{'━' * 60}")
+    print(f"  Selected {len(all_selected)} task(s): {[t['id'] for t in all_selected]}")
+    if already_done:
+        print(f"  ⏭ Already completed ({len(already_done)}): {[t['id'] for t in already_done]}")
+    if pending:
+        print(f"  ▶ To execute ({len(pending)}):")
+        for t in pending:
+            print(f"    - {t['id']}: {t['description'][:60]}")
+    else:
+        print(f"\n  ✓ All selected tasks are already complete!")
+        return True
+
+    # Execute in batches
+    batch_size = args.batch_size
+    i = 0
+    while i < len(pending):
+        if state['rounds_this_run'] >= args.max_rounds:
+            print(f"\n⚠ Reached max rounds ({args.max_rounds}). Pausing.")
+            return False
+
+        # Re-read task source to check if tasks are now completed
+        fresh_selected = get_selected_tasks(task_source, selection)
+        fresh_pending = [t for t in fresh_selected if not t.get('completed')]
+
+        if not fresh_pending:
+            print(f"\n  ✓ All selected tasks completed!")
+            return True
+
+        batch = fresh_pending[:batch_size]
+        state['round'] += 1
+        state['rounds_this_run'] += 1
+
+        current_batch_ids = [t['id'] for t in batch]
+
+        if current_batch_ids == state.get('last_batch'):
+            state['retry_count'] = state.get('retry_count', 0) + 1
+            if state['retry_count'] > state.get('max_retries', 3):
+                print(f"    Reached max retries ({state.get('max_retries', 3)}). Aborting.")
+                return False
+            print(f"\n  [Round {state['round']}] 🔁 Retry {state['retry_count']}/{state.get('max_retries', 3)} for: {current_batch_ids}")
+        else:
+            state['retry_count'] = 0
+            state['last_batch'] = current_batch_ids
+            remaining = len(fresh_pending)
+            print(f"\n  [Round {state['round']}] ▶ Processing {len(batch)}/{remaining} selected task(s)...")
+            for t in batch:
+                print(f"    - {t['id']}: {t['description'][:60]}")
+
+        _execute_round(batch, args, base_dir, runs_dir, state, results_file, label=f"selected({selection})")
+        i += batch_size
 
     return True
 
@@ -234,8 +331,18 @@ def main():
     parser.add_argument('--max-retries', type=int, default=3, help='Maximum retries per batch')
     parser.add_argument('--phase', type=str, default=None,
                         help='Run only a specific phase (e.g. "Phase 1: File Operations")')
+    parser.add_argument('--tasks', type=str, default=None,
+                        help='Select specific tasks to execute. '
+                             'Range: "T001:T005" (from T001 to T005). '
+                             'Cherry-pick: "T001,T003,T007" (only these). '
+                             'Single: "T003" (just one task). '
+                             'Implies --mode task.')
     parser.add_argument('--reset', action='store_true',
                         help='Clean up all generated files (state.json, results.json, runs/, etc.) and exit')
+    parser.add_argument('--template', type=str, default=None,
+                        help='Path to a custom prompt template file (see build-prompt --init-template)')
+    parser.add_argument('--init-template', nargs='?', const='.prompt-template.md', metavar='PATH',
+                        help='Generate a default prompt template file for customization and exit')
     
     # Optional flags to override default output locations (useful if not running in current dir)
     parser.add_argument('--work-dir', type=str, default='.', help='Working directory for output files (state, results, runs)')
@@ -243,6 +350,13 @@ def main():
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir).absolute()
+
+    if args.init_template is not None:
+        output_path = build_prompt.init_template(args.init_template)
+        print(f"✓ Template generated: {output_path.absolute()}")
+        print(f"  Edit it to customize your prompt, then use:")
+        print(f"  scheduler-harness --task-source tasks.md --template {output_path}")
+        sys.exit(0)
 
     if args.reset:
         task_source = Path(args.task_source).absolute() if args.task_source else None
@@ -282,6 +396,10 @@ def main():
 
     state['rounds_this_run'] = 0
 
+    # When --tasks is used, implicitly set mode to 'task'
+    if args.tasks:
+        args.mode = 'task'
+
     phases = get_phases(task_source)
 
     print("═" * 60)
@@ -293,9 +411,18 @@ def main():
     print(f"  Max rounds:    {args.max_rounds}")
     print(f"  Start round:   {state['round']}")
     print(f"  Mode:          {args.mode} (batch size: {args.batch_size if args.mode == 'task' else 'ALL'})")
+    if args.tasks:
+        print(f"  Task filter:   {args.tasks}")
     print(f"  Max retries:   {args.max_retries}")
+    print(f"  Template:      {args.template or '(built-in default)'}")
     print(f"  Results file:  {results_file}")
     print(f"  Phases found:  {len(phases)}")
+
+    # Get selected task IDs for highlighting (if --tasks is used)
+    selected_task_ids = set()
+    if args.tasks:
+        selected_raw = get_selected_tasks(task_source, args.tasks)
+        selected_task_ids = {t['id'] for t in selected_raw}
 
     if phases:
         print(f"\n{'─' * 60}")
@@ -305,34 +432,47 @@ def main():
             status = "✓ DONE" if p['all_done'] else f"  {p['remaining']} remaining"
             phase_filter = " ← (selected)" if args.phase and p['phase'] == args.phase else ""
             print(f"  [{status}] {p['phase']} ({p['completed']}/{p['total']}){phase_filter}")
+            # If --tasks is used, highlight selected tasks under each phase
+            if selected_task_ids:
+                phase_selected = [tid for tid in p.get('task_ids', []) if tid in selected_task_ids]
+                if phase_selected:
+                    print(f"           ↳ selected: {phase_selected}")
     print("═" * 60)
 
-    if args.phase:
-        target_phases = [p for p in phases if p['phase'] == args.phase]
-        if not target_phases:
-            print(f"\nError: Phase '{args.phase}' not found.")
-            print(f"Available phases: {[p['phase'] for p in phases]}")
-            sys.exit(1)
-    else:
-        target_phases = [p for p in phases if not p['all_done']]
-
-    if not target_phases:
-        print("\n✓ All phases are already complete!")
-        sys.exit(0)
-
-    for phase_info in target_phases:
-        phase_name = phase_info['phase']
-
-        if phase_info['all_done']:
-            print(f"\n  ⏭ Skipping '{phase_name}' (already complete)")
-            continue
-
-        completed = run_phase(
-            phase_name, args, work_dir, runs_dir, state, results_file
-        )
+    # --tasks mode: run only selected tasks (bypass phase logic)
+    if args.tasks:
+        completed = run_selected_tasks(args, work_dir, runs_dir, state, results_file)
 
         if not completed:
-            break
+            pass  # fall through to final summary
+    else:
+        # Normal phase-based execution
+        if args.phase:
+            target_phases = [p for p in phases if p['phase'] == args.phase]
+            if not target_phases:
+                print(f"\nError: Phase '{args.phase}' not found.")
+                print(f"Available phases: {[p['phase'] for p in phases]}")
+                sys.exit(1)
+        else:
+            target_phases = [p for p in phases if not p['all_done']]
+
+        if not target_phases:
+            print("\n✓ All phases are already complete!")
+            sys.exit(0)
+
+        for phase_info in target_phases:
+            phase_name = phase_info['phase']
+
+            if phase_info['all_done']:
+                print(f"\n  ⏭ Skipping '{phase_name}' (already complete)")
+                continue
+
+            completed = run_phase(
+                phase_name, args, work_dir, runs_dir, state, results_file
+            )
+
+            if not completed:
+                break
 
         accumulated = load_accumulated_results(results_file)
         if accumulated:
