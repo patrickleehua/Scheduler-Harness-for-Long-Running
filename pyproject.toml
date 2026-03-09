@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scheduler-harness"
+version = "0.1.0"
+description = "A task execution harness that orchestrates LLMs to execute long-running tasks autonomously."
+readme = "README.md"
+authors = [
+    { name = "leehua" },
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/patricleehua/Scheduler-Harness-for-Long-Running"
+
+[project.scripts]
+# Command to run the harness (e.g., scheduler-harness --task-source tasks.md)
+scheduler-harness = "scheduler_harness.cli:main"
+# Scripts for backward compatibility/standalone usage
+parse-tasks = "scheduler_harness.parse_tasks:main"
+build-prompt = "scheduler_harness.build_prompt:main"
+apply-results = "scheduler_harness.apply_results:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scheduler_harness"]
