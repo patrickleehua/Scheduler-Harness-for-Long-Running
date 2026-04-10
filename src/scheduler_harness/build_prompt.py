@@ -7,6 +7,7 @@ Users can generate a default template, modify it freely, and pass it at runtime.
 
 Runtime placeholders (auto-populated from task data, NOT user-editable):
     {{PREVIOUS_RESULTS}}  - Previous completed task results (auto-generated)
+    {{PROGRESS}}          - Existing progress files content (from progress/*.txt)
     {{TASK_ID_LIST}}      - Newline-separated list of task IDs to work on
     {{TASK_DETAILS}}      - Formatted task descriptions (### T001\\nDescription...)
 
@@ -31,27 +32,32 @@ from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────
 # Default template — written as plain text.
-# Only 3 runtime placeholders exist (auto-populated from data).
+# Only 4 runtime placeholders exist (auto-populated from data).
 # Everything else is directly editable by the user.
 # ──────────────────────────────────────────────────────────────
 
 DEFAULT_TEMPLATE = """\
 You are a stateless coding worker.
 {{PREVIOUS_RESULTS}}
+{{PROGRESS}}
 Work ONLY on these task IDs:
 {{TASK_ID_LIST}}
 
 Task Details:
 {{TASK_DETAILS}}
 
-Rules:
+Execution Rules:
 - Do only the assigned tasks listed above
 - Do not start other tasks
-- If a task is completed, report it clearly by task ID
-- If a task is blocked or failed, report it clearly by task ID
+- If completed, report it clearly by task ID
+- If blocked or failed, report it clearly by task ID
 - Do not claim unfinished work is done
-- After completing each task, verify your work
-- Include meaningful output info for each completed task (file paths, key values, etc.)
+
+Self-Check (before starting):
+- If Progress section shows any [blocked] task from a previous session:
+  - Attempt to fix once
+  - If fix fails, report ALL remaining tasks as "blocked" with the reason
+- Do NOT start new tasks while previous errors are unresolved
 
 At the end, output a JSON object in this exact shape (no additional text after it):
 
@@ -86,27 +92,71 @@ TEMPLATE_FILE_HEADER = """\
 # Prompt Template for Scheduler Harness
 # ─────────────────────────────────────────────────────────────
 #
-# Edit this file freely to customize the prompt sent to the LLM worker.
-# All text is sent as-is, except for 3 runtime placeholders:
+# This template defines the SCHEDULER PROTOCOL only:
+#   - Task assignment and scoping
+#   - Self-check for blocked tasks
+#   - Output JSON format
 #
+# Project-level rules (testing, git, progress format) should go
+# in CLAUDE.md — Claude Code loads it automatically.
+#
+# Runtime placeholders (auto-populated from task data):
 #   {{PREVIOUS_RESULTS}}  - Auto-replaced with completed task results
+#   {{PROGRESS}}          - Auto-replaced with existing progress file content
 #   {{TASK_ID_LIST}}      - Auto-replaced with the task IDs for this round
 #   {{TASK_DETAILS}}      - Auto-replaced with full task descriptions
-#
-# These 3 placeholders are filled automatically from your task data.
-# Everything else is plain text — edit it directly!
-#
-# Examples of customizations you can make:
-#   - Change the role description (first line)
-#   - Add domain-specific instructions (e.g. "Always write unit tests")
-#   - Remove or reorder sections
-#   - Change the output format
-#   - Add project-specific context
 #
 # Lines starting with # at the TOP of the file are stripped as comments.
 # ─────────────────────────────────────────────────────────────
 
 """
+
+
+DEFAULT_CLAUDE_MD = """\
+# Project Rules for Scheduler Harness Workers
+
+## Testing Requirements (MANDATORY)
+- Code must have no syntax errors
+- Lint must pass
+- Build must succeed
+- For UI-related changes: verify in browser, test interactions
+- Do NOT mark a task as completed unless all tests pass
+
+## Progress Recording
+- For each assigned task, create/update `progress/{TaskID}.txt`:
+  - Task ID and description
+  - Status: `active` / `resolved` / `blocked`
+  - What was done
+  - How tested
+  - Notes
+
+## Blocking Rules
+- If blocked: report what is blocking + what is needed from human
+- All remaining tasks in batch are also blocked
+
+## Git Commit Rules
+- If code modified and tests pass, commit with task ID in message
+  - Format: `feat(T001): description` or `fix(T002): description`
+"""
+
+
+def discover_project_files(base_dir: Path) -> dict:
+    """
+    Auto-discover project configuration files from base_dir.
+
+    Looks for:
+      - .prompt-template.md → custom prompt template
+      - CLAUDE.md → project rules (auto-loaded by claude -p)
+
+    Returns dict with 'template' key (Path or None).
+    """
+    result = {'template': None}
+
+    template_file = base_dir / '.prompt-template.md'
+    if template_file.exists():
+        result['template'] = template_file
+
+    return result
 
 
 def _strip_template_comments(template: str) -> str:
@@ -142,6 +192,40 @@ def _build_previous_results_section(previous_results: dict) -> str:
         "\n## Previous Task Results (for context)\n"
         "The following tasks were completed previously. You can use their results:\n\n"
         + "\n".join(context_lines)
+        + "\n"
+    )
+
+
+def _build_progress_section(base_dir: Path, task_ids: list[str]) -> str:
+    """
+    Build the progress section from existing progress/ files.
+
+    Reads progress/{TaskID}.txt files for current tasks AND any blocked tasks.
+    Returns empty string if no progress files exist.
+    """
+    progress_dir = base_dir / 'progress'
+    if not progress_dir.exists():
+        return ""
+
+    entries = []
+    for f in sorted(progress_dir.glob('*.txt')):
+        content = f.read_text(encoding='utf-8').strip()
+        if not content:
+            continue
+        task_id = f.stem
+        # Include: current tasks OR any blocked tasks
+        is_current = task_id in task_ids
+        is_blocked = 'Status: blocked' in content or '[blocked]' in content
+        if is_current or is_blocked:
+            entries.append(f"### {task_id}\n{content}")
+
+    if not entries:
+        return ""
+
+    return (
+        "\n## Progress Log\n"
+        "The following progress files exist from previous sessions:\n\n"
+        + "\n\n".join(entries)
         + "\n"
     )
 
@@ -205,6 +289,7 @@ def build_prompt(
     previous_results: dict = None,
     template_path: str | Path | None = None,
     extra_variables: dict = None,
+    base_dir: str | Path | None = None,
 ) -> str:
     """
     Generate worker prompt for the given tasks.
@@ -214,6 +299,7 @@ def build_prompt(
         previous_results: Dict of previous task results {task_id: result_data}
         template_path: Path to custom template file, or None for default
         extra_variables: Additional custom variables to inject into the template
+        base_dir: Project base directory (for reading progress/ files)
 
     Returns:
         Prompt string for LLM worker
@@ -222,10 +308,12 @@ def build_prompt(
         return ""
 
     template = load_template(template_path)
+    task_ids = [t['id'] for t in tasks]
 
-    # Build runtime variables (these 3 are auto-populated from data)
+    # Build runtime variables (auto-populated from data)
     variables = {
         'PREVIOUS_RESULTS': _build_previous_results_section(previous_results),
+        'PROGRESS': _build_progress_section(Path(base_dir), task_ids) if base_dir else "",
         'TASK_ID_LIST': _build_task_id_list(tasks),
         'TASK_DETAILS': _build_task_details(tasks),
     }
@@ -237,24 +325,33 @@ def build_prompt(
     return render_template(template, variables)
 
 
-def init_template(output_path: str | Path | None = None) -> Path:
+def init_template(output_path: str | Path | None = None) -> tuple[Path, Path | None]:
     """
-    Generate a default template file that users can customize.
+    Generate a default template file and CLAUDE.md for project rules.
 
     Args:
         output_path: Where to write the template. Defaults to .prompt-template.md
 
     Returns:
-        Path to the generated template file
+        Tuple of (template path, claude_md path or None if skipped)
     """
     if output_path is None:
         path = Path('.prompt-template.md')
     else:
         path = Path(output_path)
 
+    # Write template
     content = TEMPLATE_FILE_HEADER + DEFAULT_TEMPLATE
     path.write_text(content, encoding='utf-8')
-    return path
+
+    # Write CLAUDE.md if it doesn't already exist
+    claude_md_path = path.parent / 'CLAUDE.md'
+    if not claude_md_path.exists():
+        claude_md_path.write_text(DEFAULT_CLAUDE_MD.lstrip(), encoding='utf-8')
+    else:
+        claude_md_path = None
+
+    return path, claude_md_path
 
 
 # ──────────────────────────────────────────────────────────────

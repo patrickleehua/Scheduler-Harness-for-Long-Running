@@ -55,6 +55,14 @@ def do_reset(base_dir: Path, task_source: Path = None):
     else:
         skipped.append("runs/")
 
+    progress_dir = base_dir / 'progress'
+    if progress_dir.exists():
+        file_count = sum(1 for _ in progress_dir.iterdir())
+        shutil.rmtree(progress_dir)
+        removed.append(f"progress/  ({file_count} file(s))")
+    else:
+        skipped.append("progress/")
+
     if task_source and task_source.exists():
         content = task_source.read_text(encoding='utf-8')
         updated = re.sub(r'^(\s*- )\[x\]', r'\1[ ]', content, flags=re.MULTILINE | re.IGNORECASE)
@@ -397,11 +405,14 @@ def _execute_round(tasks: list[dict], args, base_dir: Path, runs_dir: Path, stat
 
     accumulated_results = load_accumulated_results(results_file)
 
-    # Build prompt (use template if specified)
-    template_path = getattr(args, 'template', None)
-    prompt = build_prompt.build_prompt(tasks, accumulated_results, template_path=template_path)
+    # Auto-discover template from project root, allow --template to override
+    project_files = build_prompt.discover_project_files(base_dir)
+    template_path = getattr(args, 'template', None) or project_files['template']
+    prompt = build_prompt.build_prompt(tasks, accumulated_results, template_path=template_path, base_dir=base_dir)
     if accumulated_results:
         print(f"    Passing {len(accumulated_results)} previous result(s) as context")
+    if template_path:
+        print(f"    Using template: {template_path}")
 
     output_file = runs_dir / f"round-{state['round']}.json"
 
@@ -433,12 +444,23 @@ def _execute_round(tasks: list[dict], args, base_dir: Path, runs_dir: Path, stat
 
     # Apply results
     print("    Applying results...")
+    has_blocked = False
     try:
         results = apply_results.parse_output_file(output_file)
         completed = results.get('completed', [])
         if completed:
             apply_results.update_tasks_file(task_source, completed)
         apply_results.save_task_results(results_file, results)
+        # Update progress file statuses
+        apply_results.update_progress_status(base_dir, results)
+        # Check for blocked tasks
+        blocked = results.get('blocked', [])
+        if blocked:
+            has_blocked = True
+            print(f"    X​ Blocked tasks: {blocked}")
+            for tid in blocked:
+                detail = results.get('results', {}).get(tid, {})
+                print(f"      {tid}: {detail.get('output', 'unknown reason')}")
     except Exception as e:
         print(f"    Apply failed: {e}")
 
@@ -452,7 +474,7 @@ def _execute_round(tasks: list[dict], args, base_dir: Path, runs_dir: Path, stat
 
     print(f"    ✓ Round {state['round']} done.")
     time.sleep(1)
-    return True
+    return not has_blocked
 
 
 def run_phase(phase_name: str, args, base_dir: Path, runs_dir: Path, state: dict, results_file: Path) -> bool:
@@ -496,7 +518,10 @@ def run_phase(phase_name: str, args, base_dir: Path, runs_dir: Path, state: dict
             for t in tasks:
                 print(f"    - {t['id']}: {t['description'][:60]}")
 
-        _execute_round(tasks, args, base_dir, runs_dir, state, results_file, label=phase_name)
+        ok = _execute_round(tasks, args, base_dir, runs_dir, state, results_file, label=phase_name)
+        if not ok:
+            print(f"\n  X​ Phase '{phase_name}' blocked. Waiting for human intervention.")
+            return False
 
     return True
 
@@ -571,7 +596,10 @@ def run_selected_tasks(args, base_dir: Path, runs_dir: Path, state: dict, result
             for t in batch:
                 print(f"    - {t['id']}: {t['description'][:60]}")
 
-        _execute_round(batch, args, base_dir, runs_dir, state, results_file, label=f"selected({selection})")
+        ok = _execute_round(batch, args, base_dir, runs_dir, state, results_file, label=f"selected({selection})")
+        if not ok:
+            print(f"\n  X​ Task selection blocked. Waiting for human intervention.")
+            return False
         i += batch_size
 
     return True
@@ -615,10 +643,13 @@ def main():
     work_dir = Path(args.work_dir).absolute()
 
     if args.init_template is not None:
-        output_path = build_prompt.init_template(args.init_template)
+        output_path, claude_md_path = build_prompt.init_template(args.init_template)
         print(f"✓ Template generated: {output_path.absolute()}")
-        print(f"  Edit it to customize your prompt, then use:")
-        print(f"  scheduler-harness --task-source tasks.md --template {output_path}")
+        if claude_md_path:
+            print(f"✓ CLAUDE.md generated: {claude_md_path.absolute()}")
+        else:
+            print(f"  CLAUDE.md already exists, skipped")
+        print(f"  Edit these files to customize your workflow.")
         sys.exit(0)
 
     if args.list_archives:
@@ -693,7 +724,12 @@ def main():
     if args.tasks:
         print(f"  Task filter:   {args.tasks}")
     print(f"  Max retries:   {args.max_retries}")
-    print(f"  Template:      {args.template or '(built-in default)'}")
+    # Auto-discover project files
+    project_files = build_prompt.discover_project_files(work_dir)
+    resolved_template = args.template or project_files['template']
+    print(f"  Template:      {resolved_template or '(built-in default)'}")
+    claude_md = work_dir / 'CLAUDE.md'
+    print(f"  CLAUDE.md:     {claude_md if claude_md.exists() else '(not found)'}")
     print(f"  Results file:  {results_file}")
     print(f"  Phases found:  {len(phases)}")
 

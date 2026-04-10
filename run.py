@@ -68,6 +68,15 @@ def do_reset(base_dir: Path, task_source: Path = None):
     else:
         skipped.append("runs/")
 
+    # Remove progress/ directory (contains per-task progress files)
+    progress_dir = base_dir / 'progress'
+    if progress_dir.exists():
+        file_count = sum(1 for _ in progress_dir.iterdir())
+        shutil.rmtree(progress_dir)
+        removed.append(f"progress/  ({file_count} file(s))")
+    else:
+        skipped.append("progress/")
+
     # Reset task checkboxes in task source file  (- [x] -> - [ ])
     if task_source and task_source.exists():
         content = task_source.read_text(encoding='utf-8')
@@ -222,11 +231,17 @@ def run_phase(phase_name: str, args, base_dir: Path, scripts_dir: Path,
         # Load accumulated results from previous rounds
         accumulated_results = load_accumulated_results(runs_dir, results_file)
 
-        # Build prompt (pass previous results for context)
+        # Build prompt (auto-discover template, pass previous results for context)
         build_cmd = [
             sys.executable, str(scripts_dir / 'build_prompt.py'),
-            '--tasks-file', str(tasks_cache)
+            '--tasks-file', str(tasks_cache),
+            '--var', f'BASE_DIR={base_dir}'
         ]
+
+        # Auto-discover .prompt-template.md from project root
+        auto_template = base_dir / '.prompt-template.md'
+        if auto_template.exists():
+            build_cmd.extend(['--template', str(auto_template)])
 
         # If we have previous results, write them to a temp file and pass it
         if accumulated_results:
@@ -285,6 +300,20 @@ def run_phase(phase_name: str, args, base_dir: Path, scripts_dir: Path,
         if apply_result.returncode != 0:
             print(f"    Apply failed: {apply_result.stderr}")
 
+        # Check for blocked tasks — if blocked, stop the phase
+        has_blocked = False
+        try:
+            round_data = json.loads(output_file.read_text(encoding='utf-8'))
+            blocked = round_data.get('blocked', [])
+            if blocked:
+                has_blocked = True
+                print(f"    ⛔ Blocked tasks: {blocked}")
+                for tid in blocked:
+                    detail = round_data.get('results', {}).get(tid, {})
+                    print(f"      {tid}: {detail.get('output', 'unknown reason')}")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
         # Update state
         state_file = base_dir / 'state.json'
         state['task_source'] = str(task_source)
@@ -302,6 +331,10 @@ def run_phase(phase_name: str, args, base_dir: Path, scripts_dir: Path,
             results_context.unlink()
 
         time.sleep(1)
+
+        if has_blocked:
+            print(f"\n  ⛔ Phase '{phase_name}' blocked. Waiting for human intervention.")
+            return False
 
     return True
 

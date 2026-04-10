@@ -112,6 +112,38 @@ def update_tasks_file(task_source: Path, completed_ids: list[str], dry_run: bool
     return changed
 
 
+def update_progress_status(base_dir: Path, results: dict) -> None:
+    """
+    Update status in progress/{TaskID}.txt files based on task results.
+
+    completed → Status: resolved
+    failed/blocked → Status: blocked
+    """
+    progress_dir = base_dir / 'progress'
+    if not progress_dir.exists():
+        return
+
+    task_results = results.get('results', {})
+
+    for task_id in results.get('completed', []):
+        f = progress_dir / f"{task_id}.txt"
+        if f.exists():
+            content = f.read_text(encoding='utf-8')
+            updated = re.sub(r'Status:\s*active', 'Status: resolved', content)
+            if updated != content:
+                f.write_text(updated, encoding='utf-8')
+                print(f"Progress updated: {task_id} → resolved")
+
+    for task_id in results.get('failed', []) + results.get('blocked', []):
+        f = progress_dir / f"{task_id}.txt"
+        if f.exists():
+            content = f.read_text(encoding='utf-8')
+            updated = re.sub(r'Status:\s*active', 'Status: blocked', content)
+            if updated != content:
+                f.write_text(updated, encoding='utf-8')
+                print(f"Progress updated: {task_id} → blocked")
+
+
 def save_task_results(results_file: Path, results: dict, dry_run: bool = False) -> bool:
     """
     Save/append task execution results to results.json.

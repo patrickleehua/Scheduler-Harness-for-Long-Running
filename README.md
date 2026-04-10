@@ -9,6 +9,8 @@ A task execution harness that orchestrates LLMs (specifically Claude) to execute
   - `phase` mode (default): Fetches all remaining tasks in the current phase and passes them to the LLM at once.
   - `task` mode: Fetches and assigns tasks individually (controlled by `--batch-size`) to ensure maximum focus.
 - **Stateful Results Accumulation**: Each task's output is recorded into `results.json` and automatically provided as context for subsequent rounds and phases. The LLM dynamically remembers exactly what it did previously.
+- **Per-Task Progress Tracking**: Each task gets its own `progress/{TaskID}.txt` file for cross-session communication. The LLM reads previous progress, self-checks for errors, and writes updates.
+- **Self-Healing & Blocking**: If a previous session left errors, the LLM attempts to fix them once. If unfixable, tasks are marked `blocked` and execution halts — waiting for human intervention.
 - **Retry Mechanism**: Automatically detects when the agent stalls or fails to complete a task. Controlled via `--max-retries` (default: 3). If it repeatedly fails a batch, the execution is safely aborted to prevent infinite cost loops.
 - **Resumable**: Saves execution state to `state.json`. If execution stops or is killed, you can run it again and it picks up right where it left off.
 
@@ -27,6 +29,17 @@ uv tool install scheduler-harness
 If you download the source code, you can also install it locally:
 ```bash
 uv pip install -e .
+```
+
+## Quick Start
+
+```bash
+# 1. Initialize project config files
+scheduler-harness --init-template
+#    → Generates .prompt-template.md (prompt skeleton) + CLAUDE.md (project rules)
+
+# 2. Run tasks
+scheduler-harness --task-source tasks.md
 ```
 
 ## Usage
@@ -48,15 +61,20 @@ scheduler-harness --task-source <path_to_tasks.md> [options]
   - Automatically implies `--mode task`. Already-completed tasks are skipped.
 - `--max-rounds`: Maximum number of round requests to execute in one run. (Default: 20)
 - `--max-retries`: Maximum consecutive retries allowed for a failing or stalled batch before aborting. (Default: 3)
-- `--reset`: Clean up all runtime-generated files (`state.json`, `results.json`, `runs/`, temp files) and exit. If `--task-source` is also provided, resets all completed checkboxes (`- [x]` → `- [ ]`) in the task file.
+- `--reset`: Clean up all runtime-generated files (`state.json`, `results.json`, `runs/`, `progress/`, temp files) and exit. If `--task-source` is also provided, resets all completed checkboxes (`- [x]` → `- [ ]`) in the task file.
 - `--archive`: Archive all current runtime-generated files (`state.json`, `results.json`, `runs/`, task source) into a timestamped directory under `archives/` and exit. Archive naming format: `<task_filename>_<yyyy-mm-dd_HH-MM-SS>/`.
 - `--restore <ARCHIVE>`: Restore runtime state from a previously created archive directory. Accepts a folder name (looked up in `archives/`) or a full path. Overwrites current files.
 - `--list-archives`: List all available archives with metadata (task source, file count, size, timestamp) and exit.
 - `--work-dir`: Working directory for output files (state, results, runs). Defaults to the current directory.
-- `--template <PATH>`: Path to a custom prompt template file. See [Prompt Template Customization](#prompt-template-customization) below.
-- `--init-template [PATH]`: Generate a default prompt template file for customization and exit. Defaults to `.prompt-template.md`.
+- `--template <PATH>`: Path to a custom prompt template file. Overrides auto-discovery. See [Prompt Template Customization](#prompt-template-customization).
+- `--init-template [PATH]`: Generate a default prompt template file and `CLAUDE.md` for customization, then exit. Defaults to `.prompt-template.md`.
 
 ### Examples
+
+**Initialize project config:**
+```bash
+scheduler-harness --init-template
+```
 
 **Default execution (process phase by phase until everything is done):**
 ```bash
@@ -119,26 +137,76 @@ Tasks are defined in standard Markdown checklists under Phase headers (`##`). Th
 ```
 *Note: Phase headers must be exactly `## Phase Title`. Task lines must be `- [ ] ID Description` where ID starts with alphabetical letters followed by numbers (e.g., T001, B23).*
 
-## Prompt Template Customization
+## Project Configuration
 
-The prompt sent to the LLM is fully customizable. The template is plain text — just edit it directly. Only 3 runtime placeholders (`{{PREVIOUS_RESULTS}}`, `{{TASK_ID_LIST}}`, `{{TASK_DETAILS}}`) are auto-filled from task data; everything else is your own text.
+The harness uses two config files, both auto-discovered from the project root:
+
+### `.prompt-template.md` — Prompt Skeleton (Scheduler Protocol)
+
+Defines how the LLM worker receives tasks. Contains runtime placeholders auto-filled from task data:
+
+| Placeholder | Description |
+|---|---|
+| `{{PREVIOUS_RESULTS}}` | Completed task results from previous rounds |
+| `{{PROGRESS}}` | Content from `progress/*.txt` files (blocked tasks + current tasks) |
+| `{{TASK_ID_LIST}}` | Task IDs for this round |
+| `{{TASK_DETAILS}}` | Full task descriptions |
+
+### `CLAUDE.md` — Project Rules (Auto-loaded by Claude)
+
+Project-level rules that Claude Code loads automatically:
+- Testing requirements (lint, build, browser checks)
+- Progress recording format (`progress/{TaskID}.txt`)
+- Blocking rules
+- Git commit conventions
+
+### Auto-Discovery
+
+The harness automatically scans for these files in the working directory:
+- `.prompt-template.md` → used as prompt template (no `--template` flag needed)
+- `CLAUDE.md` → loaded by Claude Code automatically
 
 ```bash
-# Generate a default template, edit it, then use it
-scheduler-harness --init-template                                        # → .prompt-template.md
-scheduler-harness --task-source tasks.md --template .prompt-template.md  # use custom template
+# Generate both files at once
+scheduler-harness --init-template
+
+# They're auto-discovered, no manual flags needed
+scheduler-harness --task-source tasks.md
 ```
+
+### Progress Files
+
+Each task gets its own progress file at `progress/{TaskID}.txt`, managed by the LLM:
+
+```markdown
+# Task: T001 - Create project directory structure
+# Status: resolved
+
+## What was done
+Created src/, tests/, docs/ directories
+
+## How tested
+- Build passed
+- Directory structure verified
+```
+
+Status values: `active` → `resolved` (success) / `blocked` (stuck)
+
+When the scheduler detects blocked tasks, it:
+1. Stops the current phase
+2. Prints blocking reasons
+3. Waits for human intervention
 
 ## How it Works
 
 1. **`parse-tasks`** scans the Markdown text to find the first Phase with uncompleted tasks.
 2. **`scheduler-harness`** fetches the tasks according to the selected `--mode` (`phase` or `task`).
-3. **`scheduler-harness`** loads the accumulated historical results from `results.json` and injects them as active context.
-4. **`build-prompt`** constructs the instruction prompt for Claude using the template (custom or built-in default).
-5. Claude executes the requested commands/bash shell prompts.
-6. **`apply-results`** parses Claude's JSON output, marks the tasks as `[x]` in the original `tasks.md`, and pushes the execution traces backward into `results.json`.
-7. Increments the state tracking in `state.json` and loops back to step 1 automatically.
-
+3. **`scheduler-harness`** loads the accumulated historical results from `results.json` and existing progress files from `progress/`.
+4. **`build-prompt`** constructs the instruction prompt using the template (auto-discovered or `--template`) and injects previous results + progress as context.
+5. Claude executes the requested commands. It reads previous progress, self-checks for errors, and writes new `progress/{TaskID}.txt` files.
+6. **`apply-results`** parses Claude's JSON output, marks tasks as `[x]` in `tasks.md`, updates progress file statuses (`active` → `resolved`/`blocked`), and saves results to `results.json`.
+7. If blocked tasks are detected, execution halts and waits for human intervention.
+8. Increments the state tracking in `state.json` and loops back to step 1 automatically.
 
 ```bash
 # Execute all tasks in order of Phase
