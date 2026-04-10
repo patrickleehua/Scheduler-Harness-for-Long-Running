@@ -63,6 +63,14 @@ def do_reset(base_dir: Path, task_source: Path = None):
     else:
         skipped.append("progress/")
 
+    signals_dir = base_dir / '.signals'
+    if signals_dir.exists():
+        file_count = sum(1 for _ in signals_dir.rglob('*') if _.is_file())
+        shutil.rmtree(signals_dir)
+        removed.append(f".signals/  ({file_count} file(s))")
+    else:
+        skipped.append(".signals/")
+
     if task_source and task_source.exists():
         content = task_source.read_text(encoding='utf-8')
         updated = re.sub(r'^(\s*- )\[x\]', r'\1[ ]', content, flags=re.MULTILINE | re.IGNORECASE)
@@ -153,6 +161,16 @@ def do_archive(base_dir: Path, task_source: Path = None):
             skipped_items.append("runs/ (empty)")
     else:
         skipped_items.append("runs/")
+
+    # Copy .signals/ directory
+    signals_dir = base_dir / '.signals'
+    if signals_dir.exists():
+        dest_signals = archive_path / '.signals'
+        shutil.copytree(signals_dir, dest_signals)
+        signal_files = sum(1 for _ in signals_dir.rglob('*') if _.is_file())
+        archived_items.append(f".signals/  ({signal_files} file(s))")
+    else:
+        skipped_items.append(".signals/")
 
     # Copy task source file
     if task_source and task_source.exists():
@@ -605,6 +623,318 @@ def run_selected_tasks(args, base_dir: Path, runs_dir: Path, state: dict, result
     return True
 
 
+# ── tmux helper functions ──────────────────────────────────────
+
+def _slugify(name: str) -> str:
+    """Convert a phase name to a filesystem-safe slug."""
+    slug = re.sub(r'[^\w\s-]', '', name.lower())
+    slug = re.sub(r'[\s:]+', '-', slug).strip('-')
+    return slug or 'phase'
+
+
+def _read_signal_status(signal_dir: Path) -> dict:
+    """Read status.json from a signal directory."""
+    status_file = signal_dir / 'status.json'
+    if status_file.exists():
+        try:
+            return json.loads(status_file.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {'status': 'waiting'}
+
+
+def _poll_signal_status(signal_dir: Path, timeout: int = 600, interval: float = 2.0) -> dict:
+    """Poll status.json until it reaches a terminal state or timeout."""
+    terminal_states = {'done', 'blocked', 'aborted', 'error'}
+    start = time.time()
+    while time.time() - start < timeout:
+        status = _read_signal_status(signal_dir)
+        if status.get('status') in terminal_states:
+            return status
+        time.sleep(interval)
+    return {'status': 'timeout'}
+
+
+def _merge_results(global_file: Path, phase_file: Path):
+    """Merge a phase's results.json into the global results file."""
+    if not phase_file.exists():
+        return
+    try:
+        phase_data = json.loads(phase_file.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError):
+        return
+    global_data = {}
+    if global_file.exists():
+        try:
+            global_data = json.loads(global_file.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            global_data = {}
+    global_data.update(phase_data)
+    global_file.write_text(json.dumps(global_data, indent=2, ensure_ascii=False), encoding='utf-8')
+
+
+def _update_dashboard(tmux, phases_info: list[dict], state: dict):
+    """Refresh the tmux dashboard pane with current progress."""
+    lines = [
+        f"  Scheduler Harness | Round {state.get('round', 0)}/{state.get('max_rounds', '?')}",
+        "  " + "=" * 50,
+    ]
+    for p in phases_info:
+        done = p['completed']
+        total = p['total']
+        remaining = total - done
+        bar_done = '█' * done
+        bar_remain = '░' * remaining
+        status_text = "DONE" if p['all_done'] else f"{remaining} left"
+        lines.append(f"  {p['phase']}: [{bar_done}{bar_remain}] {done}/{total} {status_text}")
+    lines.append("  " + "=" * 50)
+    lines.append("  Attach: tmux attach -t " + tmux.session_name)
+
+    # Clear and redraw dashboard
+    tmux.clear_pane('dashboard')
+    for line in lines:
+        tmux.send_keys('dashboard', f'echo "{line}"')
+    time.sleep(0.1)
+
+
+def _get_phase_progress(task_source: Path, phase_name: str) -> dict:
+    """Get current progress for a phase by re-reading task source."""
+    content = task_source.read_text(encoding='utf-8')
+    all_tasks = parse_tasks.parse_tasks(content)
+    phase_tasks = [t for t in all_tasks if t.get('phase') == phase_name]
+    completed = sum(1 for t in phase_tasks if t.get('completed'))
+    return {'total': len(phase_tasks), 'completed': completed}
+
+
+def run_tmux_sequential(tmux, target_phases: list[dict], args, work_dir: Path, runs_dir: Path, state: dict, results_file: Path):
+    """tmux mode: single worker window, sequential phase execution."""
+    from .tmux_manager import TmuxManager
+
+    signal_dir = work_dir / '.signals' / 'main'
+    signal_dir.mkdir(parents=True, exist_ok=True)
+
+    tmux.create_window('worker')
+    tmux.send_keys('worker', f'scheduler-worker --signal-dir "{signal_dir}" '
+                              f'--task-source "{args.task_source}" --phase "main"')
+
+    # Wait for worker to start
+    time.sleep(2)
+
+    for phase_info in target_phases:
+        if phase_info['all_done']:
+            continue
+        phase_name = phase_info['phase']
+        print(f"\n{'━' * 60}")
+        print(f"  Phase: {phase_name} (tmux worker)")
+        print(f"{'━' * 60}")
+
+        while True:
+            if state['rounds_this_run'] >= args.max_rounds:
+                print(f"\n  Reached max rounds ({args.max_rounds}). Pausing.")
+                return
+
+            limit = None if args.mode == 'phase' else args.batch_size
+            tasks = get_uncompleted_tasks_for_phase(args.task_source, phase_name, limit)
+            if not tasks:
+                print(f"\n  Phase '{phase_name}' complete!")
+                break
+
+            # Retry detection
+            current_batch_ids = [t['id'] for t in tasks]
+            if current_batch_ids == state.get('last_batch'):
+                state['retry_count'] = state.get('retry_count', 0) + 1
+                if state['retry_count'] > state.get('max_retries', 3):
+                    print(f"    Max retries reached. Aborting phase.")
+                    return
+                print(f"    Retry {state['retry_count']}/{state.get('max_retries', 3)}")
+            else:
+                state['retry_count'] = 0
+                state['last_batch'] = current_batch_ids
+
+            state['round'] += 1
+            state['rounds_this_run'] += 1
+
+            # Build prompt
+            accumulated_results = load_accumulated_results(results_file)
+            project_files = build_prompt.discover_project_files(work_dir)
+            template_path = getattr(args, 'template', None) or project_files['template']
+            prompt = build_prompt.build_prompt(tasks, accumulated_results,
+                                               template_path=template_path, base_dir=work_dir)
+
+            # Dispatch to worker
+            (signal_dir / 'prompt.txt').write_text(prompt, encoding='utf-8')
+            task_ids = [t['id'] for t in tasks]
+            print(f"    Round {state['round']}: dispatched {task_ids}, waiting...")
+
+            # Poll for completion
+            status = _poll_signal_status(signal_dir, timeout=600)
+            if status.get('status') == 'aborted':
+                print("    Worker aborted.")
+                return
+            if status.get('status') == 'blocked':
+                print(f"    Blocked tasks: {status.get('blocked', [])}")
+                break
+            if status.get('status') == 'timeout':
+                print("    Worker timed out.")
+                break
+            if status.get('status') == 'error':
+                print(f"    Worker error: {status.get('error', 'unknown')}")
+                break
+
+            # Merge worker results to global
+            worker_results = signal_dir / 'results.json'
+            _merge_results(results_file, worker_results)
+
+            # Save round output to runs/
+            output_src = signal_dir / 'output.json'
+            if output_src.exists():
+                runs_dir.mkdir(parents=True, exist_ok=True)
+                output_dst = runs_dir / f"round-{state['round']}.json"
+                shutil.copy2(output_src, output_dst)
+
+            # Update state
+            state_file = work_dir / 'state.json'
+            state['task_source'] = str(args.task_source)
+            state['current_phase'] = phase_name
+            state_file.write_text(json.dumps(state, indent=2), encoding='utf-8')
+
+            # Refresh dashboard
+            _update_dashboard(tmux, target_phases, state)
+            print(f"    Round {state['round']} done.")
+
+            # Reset signal for next round
+            _read_signal_status(signal_dir)  # clear
+
+
+def run_parallel_phases(tmux, target_phases: list[dict], args, work_dir: Path, state: dict, results_file: Path):
+    """tmux mode: one worker window per phase, all running in parallel."""
+    active = {}
+
+    for phase_info in target_phases:
+        if phase_info['all_done']:
+            continue
+        slug = _slugify(phase_info['phase'])
+        signal_dir = work_dir / '.signals' / slug
+        signal_dir.mkdir(parents=True, exist_ok=True)
+
+        tmux.create_window(slug)
+        tmux.send_keys(slug,
+            f'scheduler-worker --signal-dir "{signal_dir}" '
+            f'--task-source "{args.task_source}" --phase "{phase_info["phase"]}"')
+        active[slug] = {
+            'phase_info': phase_info,
+            'internal_state': 'starting',
+            'round': 0,
+        }
+        print(f"  Worker started for: {phase_info['phase']} (window: {slug})")
+
+    if not active:
+        print("\n  All phases already complete!")
+        return
+
+    # Give workers time to start
+    time.sleep(2)
+
+    # Main orchestrator loop
+    while active:
+        completed_slugs = []
+
+        for slug, info in list(active.items()):
+            signal_dir = work_dir / '.signals' / slug
+            status = _read_signal_status(signal_dir)
+            phase_name = info['phase_info']['phase']
+
+            if status.get('status') in ('done', 'blocked', 'error') and info['internal_state'] == 'running':
+                # Worker finished a round — merge results
+                worker_results = signal_dir / 'results.json'
+                _merge_results(results_file, worker_results)
+
+                state['round'] += 1
+                state['rounds_this_run'] += 1
+                info['round'] = status.get('round', info['round'])
+
+                if status.get('status') == 'blocked':
+                    print(f"  [{slug}] Blocked: {status.get('blocked', [])}")
+                    completed_slugs.append(slug)
+                    continue
+                if status.get('status') == 'error':
+                    print(f"  [{slug}] Error: {status.get('error', 'unknown')}")
+                    completed_slugs.append(slug)
+                    continue
+
+                # Check if phase is truly complete
+                progress = _get_phase_progress(args.task_source, phase_name)
+                if progress['completed'] >= progress['total']:
+                    print(f"  [{slug}] Phase '{phase_name}' complete!")
+                    completed_slugs.append(slug)
+                    continue
+
+                # Dispatch next round
+                limit = None if args.mode == 'phase' else args.batch_size
+                tasks = get_uncompleted_tasks_for_phase(args.task_source, phase_name, limit)
+                if tasks:
+                    accumulated_results = load_accumulated_results(results_file)
+                    project_files = build_prompt.discover_project_files(work_dir)
+                    template_path = getattr(args, 'template', None) or project_files['template']
+                    prompt = build_prompt.build_prompt(tasks, accumulated_results,
+                                                       template_path=template_path, base_dir=work_dir)
+                    (signal_dir / 'prompt.txt').write_text(prompt, encoding='utf-8')
+                    info['internal_state'] = 'running'
+                    print(f"  [{slug}] Round dispatched: {[t['id'] for t in tasks]}")
+                else:
+                    completed_slugs.append(slug)
+
+            elif status.get('status') == 'aborted':
+                print(f"  [{slug}] Aborted by user.")
+                completed_slugs.append(slug)
+
+            elif info['internal_state'] == 'starting' and status.get('status') in ('waiting', 'running'):
+                # Dispatch first round
+                limit = None if args.mode == 'phase' else args.batch_size
+                tasks = get_uncompleted_tasks_for_phase(args.task_source, phase_name, limit)
+                if tasks:
+                    accumulated_results = load_accumulated_results(results_file)
+                    project_files = build_prompt.discover_project_files(work_dir)
+                    template_path = getattr(args, 'template', None) or project_files['template']
+                    prompt = build_prompt.build_prompt(tasks, accumulated_results,
+                                                       template_path=template_path, base_dir=work_dir)
+                    (signal_dir / 'prompt.txt').write_text(prompt, encoding='utf-8')
+                    info['internal_state'] = 'running'
+                    print(f"  [{slug}] First round dispatched: {[t['id'] for t in tasks]}")
+                else:
+                    completed_slugs.append(slug)
+
+        # Cleanup completed workers
+        for slug in completed_slugs:
+            # Merge final results
+            signal_dir = work_dir / '.signals' / slug
+            worker_results = signal_dir / 'results.json'
+            _merge_results(results_file, worker_results)
+            tmux.kill_window(slug)
+            del active[slug]
+
+        # Update state file and dashboard
+        state_file = work_dir / 'state.json'
+        state['task_source'] = str(args.task_source)
+        state_file.write_text(json.dumps(state, indent=2), encoding='utf-8')
+
+        # Refresh phase summaries for dashboard
+        refreshed_phases = get_phases(args.task_source)
+        _update_dashboard(tmux, refreshed_phases, state)
+
+        # Check max rounds
+        if state['rounds_this_run'] >= args.max_rounds:
+            print(f"\n  Reached max rounds ({args.max_rounds}). Stopping.")
+            break
+
+        time.sleep(2)
+
+    # Kill remaining workers
+    for slug in list(active.keys()):
+        tmux.kill_window(slug)
+    active.clear()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Scheduler Harness for Long-Running')
     parser.add_argument('--task-source', required=False, default=None, help='Path to tasks.md')
@@ -635,6 +965,16 @@ def main():
     parser.add_argument('--init-template', nargs='?', const='.prompt-template.md', metavar='PATH',
                         help='Generate a default prompt template file for customization and exit')
     
+    # tmux options
+    parser.add_argument('--tmux', action='store_true',
+                        help='Use tmux for execution (real-time visibility, requires tmux)')
+    parser.add_argument('--no-tmux', action='store_true',
+                        help='Force disable tmux even if available')
+    parser.add_argument('--parallel', action='store_true',
+                        help='Run multiple phases in parallel (requires --tmux)')
+    parser.add_argument('--session', type=str, default='scheduler',
+                        help='tmux session name (default: scheduler)')
+
     # Optional flags to override default output locations (useful if not running in current dir)
     parser.add_argument('--work-dir', type=str, default='.', help='Working directory for output files (state, results, runs)')
     
@@ -754,51 +1094,102 @@ def main():
                     print(f"           ↳ selected: {phase_selected}")
     print("═" * 60)
 
-    # --tasks mode: run only selected tasks (bypass phase logic)
-    if args.tasks:
-        completed = run_selected_tasks(args, work_dir, runs_dir, state, results_file)
+    # ── Determine execution mode ──────────────────────────────
+    from .tmux_manager import TmuxManager
+    use_tmux = args.tmux and not args.no_tmux and TmuxManager.is_available()
 
-        if not completed:
-            pass  # fall through to final summary
-    else:
-        # Normal phase-based execution
-        if args.phase:
-            target_phases = [p for p in phases if p['phase'] == args.phase]
-            if not target_phases:
-                print(f"\nError: Phase '{args.phase}' not found.")
-                print(f"Available phases: {[p['phase'] for p in phases]}")
-                sys.exit(1)
+    if args.tmux and not TmuxManager.is_available():
+        print("\n  tmux not available on this system, falling back to subprocess mode.")
+        use_tmux = False
+
+    if args.parallel and not use_tmux:
+        print("\n  --parallel requires --tmux. Running sequentially.")
+        args.parallel = False
+
+    if use_tmux:
+        tmux = TmuxManager(args.session, work_dir)
+        tmux.create_session()
+
+        if args.tasks:
+            # --tasks mode not supported with tmux yet
+            print("\n  --tasks mode not yet supported with --tmux. Running without tmux.")
+            tmux.kill_session()
+            use_tmux = False
         else:
-            target_phases = [p for p in phases if not p['all_done']]
+            if args.phase:
+                target_phases = [p for p in phases if p['phase'] == args.phase]
+                if not target_phases:
+                    print(f"\nError: Phase '{args.phase}' not found.")
+                    print(f"Available phases: {[p['phase'] for p in phases]}")
+                    tmux.kill_session()
+                    sys.exit(1)
+            else:
+                target_phases = [p for p in phases if not p['all_done']]
 
-        if not target_phases:
-            print("\n✓ All phases are already complete!")
-            sys.exit(0)
+            if not target_phases:
+                print("\n  All phases are already complete!")
+                tmux.kill_session()
+                sys.exit(0)
 
-        for phase_info in target_phases:
-            phase_name = phase_info['phase']
+            try:
+                if args.parallel:
+                    run_parallel_phases(tmux, target_phases, args, work_dir, state, results_file)
+                else:
+                    run_tmux_sequential(tmux, target_phases, args, work_dir, runs_dir, state, results_file)
+            except KeyboardInterrupt:
+                print("\n\n  Interrupted. tmux session preserved.")
+                print(f"  Attach to inspect: tmux attach -t {args.session}")
+                print(f"  Kill when done:    tmux kill-session -t {args.session}")
+                sys.exit(0)
 
-            if phase_info['all_done']:
-                print(f"\n  ⏭ Skipping '{phase_name}' (already complete)")
-                continue
+            tmux.kill_session()
 
-            completed = run_phase(
-                phase_name, args, work_dir, runs_dir, state, results_file
-            )
+    if not use_tmux:
+        # --tasks mode: run only selected tasks (bypass phase logic)
+        if args.tasks:
+            completed = run_selected_tasks(args, work_dir, runs_dir, state, results_file)
 
             if not completed:
-                break
+                pass  # fall through to final summary
+        else:
+            # Normal phase-based execution
+            if args.phase:
+                target_phases = [p for p in phases if p['phase'] == args.phase]
+                if not target_phases:
+                    print(f"\nError: Phase '{args.phase}' not found.")
+                    print(f"Available phases: {[p['phase'] for p in phases]}")
+                    sys.exit(1)
+            else:
+                target_phases = [p for p in phases if not p['all_done']]
 
-        accumulated = load_accumulated_results(results_file)
-        if accumulated:
-            print(f"\n{'─' * 60}")
-            print(f"  Accumulated Results ({len(accumulated)} tasks):")
-            print(f"{'─' * 60}")
-            for tid, res in accumulated.items():
-                status_icon = "✓" if res.get('status') == 'completed' else "✗"
-                output = res.get('output', 'no output')[:60]
-                print(f"    {status_icon} {tid}: {output}")
-            print(f"{'─' * 60}")
+            if not target_phases:
+                print("\n✓ All phases are already complete!")
+                sys.exit(0)
+
+            for phase_info in target_phases:
+                phase_name = phase_info['phase']
+
+                if phase_info['all_done']:
+                    print(f"\n  ⏭ Skipping '{phase_name}' (already complete)")
+                    continue
+
+                completed = run_phase(
+                    phase_name, args, work_dir, runs_dir, state, results_file
+                )
+
+                if not completed:
+                    break
+
+            accumulated = load_accumulated_results(results_file)
+            if accumulated:
+                print(f"\n{'─' * 60}")
+                print(f"  Accumulated Results ({len(accumulated)} tasks):")
+                print(f"{'─' * 60}")
+                for tid, res in accumulated.items():
+                    status_icon = "✓" if res.get('status') == 'completed' else "✗"
+                    output = res.get('output', 'no output')[:60]
+                    print(f"    {status_icon} {tid}: {output}")
+                print(f"{'─' * 60}")
 
     print(f"\n{'═' * 60}")
     final_results = load_accumulated_results(results_file)

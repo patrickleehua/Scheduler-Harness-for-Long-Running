@@ -13,6 +13,8 @@ A task execution harness that orchestrates LLMs (specifically Claude) to execute
 - **Self-Healing & Blocking**: If a previous session left errors, the LLM attempts to fix them once. If unfixable, tasks are marked `blocked` and execution halts — waiting for human intervention.
 - **Retry Mechanism**: Automatically detects when the agent stalls or fails to complete a task. Controlled via `--max-retries` (default: 3). If it repeatedly fails a batch, the execution is safely aborted to prevent infinite cost loops.
 - **Resumable**: Saves execution state to `state.json`. If execution stops or is killed, you can run it again and it picks up right where it left off.
+- **tmux Integration**: Run tasks inside tmux sessions for real-time visibility. Observe Claude's output live, pause/resume workers, and inspect state interactively. Supports parallel phase execution with a live dashboard.
+- **Parallel Execution**: With `--tmux --parallel`, multiple phases run concurrently in separate tmux windows, each with its own worker process and a shared dashboard pane.
 
 ## Installation
 
@@ -68,6 +70,10 @@ scheduler-harness --task-source <path_to_tasks.md> [options]
 - `--work-dir`: Working directory for output files (state, results, runs). Defaults to the current directory.
 - `--template <PATH>`: Path to a custom prompt template file. Overrides auto-discovery. See [Prompt Template Customization](#prompt-template-customization).
 - `--init-template [PATH]`: Generate a default prompt template file and `CLAUDE.md` for customization, then exit. Defaults to `.prompt-template.md`.
+- `--tmux`: Use tmux for execution. Creates a tmux session with separate windows for the dashboard and worker(s), enabling real-time observation and user interaction. Requires tmux to be installed (Linux/macOS/WSL only).
+- `--no-tmux`: Explicitly disable tmux mode even if tmux is available. Uses the default subprocess execution.
+- `--parallel`: Run multiple phases in parallel, each in its own tmux window. Requires `--tmux`. Results from each phase are kept in independent files and merged at completion.
+- `--session <NAME>`: Name for the tmux session. Default: `scheduler`.
 
 ### Examples
 
@@ -119,6 +125,32 @@ scheduler-harness --task-source demo_tasks.md --tasks T006
 **Execute selected tasks with batch size 2:**
 ```bash
 scheduler-harness --task-source demo_tasks.md --tasks "T003:T007" --batch-size 2
+```
+
+**Run with tmux (real-time observation):**
+```bash
+scheduler-harness --task-source demo_tasks.md --tmux
+# Attach to the session to watch live output:
+tmux attach -t scheduler
+```
+
+**Run multiple phases in parallel:**
+```bash
+scheduler-harness --task-source demo_tasks.md --tmux --parallel
+# Each phase runs in its own tmux window
+# A dashboard pane shows overall progress
+```
+
+**Pause/resume/abort a running worker:**
+```bash
+# Pause
+echo "pause" > .signals/main/control
+
+# Resume
+echo "resume" > .signals/main/control
+
+# Abort
+echo "abort" > .signals/main/control
 ```
 
 ## Task File Format (`tasks.md`)
@@ -233,3 +265,50 @@ scheduler-harness --list-archives
 # Restore from a specific archive
 scheduler-harness --restore demo_tasks_2026-03-09_14-30-00
 ```
+
+## tmux Mode
+
+When `--tmux` is enabled, the harness creates a tmux session with the following layout:
+
+```
+┌─ tmux session: scheduler ─────────────────────────────────┐
+│ ┌─ Window 0: Dashboard ─────────────────────────────────┐ │
+│ │  Round 3/20                                           │ │
+│ │  Phase 1: Setup          [████░░] 3/5  Status: running│ │
+│ │  Phase 2: Implementation [░░░░░░] 0/4  Status: waiting│ │
+│ └───────────────────────────────────────────────────────┘ │
+│ ┌─ Window 1: worker (or phase name) ────────────────────┐ │
+│ │  $ claude --print ... (live output stream)             │ │
+│ └───────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────┘
+```
+
+**Architecture:**
+
+The orchestrator (`cli.py`) spawns worker processes inside tmux windows. Workers communicate with the orchestrator through file-based signals in `.signals/`:
+
+```
+.signals/
+  main/                # Sequential mode
+    prompt.txt         # Orchestrator → Worker (task prompt)
+    output.json        # Worker → Orchestrator (Claude output)
+    status.json        # Worker → Orchestrator (running/done/blocked/error)
+    control            # User → Worker (pause/resume/skip/abort)
+    results.json       # Per-phase accumulated results
+```
+
+**Parallel mode (`--tmux --parallel`):**
+
+Each phase gets its own `.signals/<phase-slug>/` directory and tmux window. Workers run independently, and the orchestrator polls their status, dispatches prompts, and merges results into the global `results.json` upon completion.
+
+**User interaction:**
+
+| Command | Effect |
+|---------|--------|
+| `echo "pause" > .signals/<slug>/control` | Pause the worker after current round |
+| `echo "resume" > .signals/<slug>/control` | Resume a paused worker |
+| `echo "abort" > .signals/<slug>/control` | Terminate the worker |
+| `tmux attach -t scheduler` | View the live session |
+| `Ctrl+C` in orchestrator | Preserves tmux session for inspection |
+
+**Cross-platform:** tmux is only available on Linux/macOS/WSL. On Windows, `--tmux` prints a warning and falls back to the standard subprocess mode automatically.
